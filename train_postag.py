@@ -1,10 +1,11 @@
-import tqdm
-import torch
-from traitlets import default
-import model_postag, use_conllulib
-from use_conllulib import CoNLLUReader
 import torch.nn as nn
+import tqdm, sys, torch
+from traitlets import default
+from pandas import read_clipboard
+import model_postag, use_conllulib
+from model_postag import RNN_postag
 from collections import defaultdict
+from use_conllulib import CoNLLUReader
 from torch.utils.data import TensorDataset, DataLoader
 
 
@@ -28,6 +29,7 @@ def fit(model, epochs, train_loader, dev_loader):
       loss.backward()
       optimizer.step()
       total_loss += loss.item()  
+    print(f"{epoch}/{epochs} ")
     print("train_loss = {:.4f}".format(total_loss / len(train_loader.dataset)))
     print("dev_loss = {:.4f} dev_acc = {:.4f}".format(*perf(model, dev_loader, criterion)))
 
@@ -45,65 +47,61 @@ def perf(model, dev_loader, criterion):
   return total_loss / total, correct / total
 
 
-def read_corpus(filename):
-    infile = open(filename, encoding='UTF-8')
-    conllu_reader = CoNLLUReader(infile=infile) 
+def read_corpus(filename, wordvocab, tagvocab, max_len, batch_size, train_mode=True, batch_mode=True):
+    if train_mode:
+      wordvocab = defaultdict(lambda: len(wordvocab))
+      wordvocab["<PAD>"]
+      wordvocab["<UNK>"]
 
-    col_name_dict = {
-        "form": ["<PAD>", "<UNK>"],  # tokens (words)
-        "upos": ["<PAD>"]            # POS tags
-    }
-    _, vocab = conllu_reader.to_int_and_vocab(col_name_dict)
-    wordvocab = vocab['form']
-    tagvocab = vocab['upos']
+      tagvocab = defaultdict(lambda: len(tagvocab))
     
     words, tags = [], []
-    
 
-    return words, tags, wordvocab, tagvocab
+    infile = open(filename, encoding='UTF-8')
+    conllu_reader = CoNLLUReader(infile=infile)
 
+    for sent in conllu_reader.readConllu():
+      
+      tag = sent[0]['upos']
+      if train_mode:
+        tags.append(tagvocab[tag])
+      else:
+        tags.append(tagvocab.get(tag, tagvocab["<PAD>"]))
+      
+      forms = [tok["form"] for tok in sent]
 
-def read_corpus_class(filename, wordvocab, tagvocab, in_type, train_mode=True, batch_mode=True):
-  if train_mode :
-    wordvocab = defaultdict(lambda : len(wordvocab))
-    tagvocab = defaultdict(lambda : len(tagvocab))
-  words, tags = [], []
-  with open(filename, 'r', encoding="utf-8") as corpus:
-    for line in corpus:
-      fields = line.strip().split()
-      tags.append(tagvocab[fields[0]])
-      fields = " ".join(fields[1:]) if in_type == "char" else  fields[1:]
-      if train_mode :
-        words.append([wordvocab[w] for w in fields])
-      else :
-        words.append([wordvocab.get(w, wordvocab["<UNK>"]) for w in fields])
-  if batch_mode :
-    dataset = TensorDataset(pad_tensor(words, 40), torch.LongTensor(tags))
-    return DataLoader(dataset, batch_size=32, shuffle=train_mode), wordvocab, tagvocab 
-  else :
-    return words, tags, wordvocab, tagvocab
-    
+      if train_mode:
+        words.append([wordvocab[w] for w in forms])
+      else:
+        words.append([wordvocab.get(w, wordvocab['<UNK>']) for w in forms])
+      
+    infile.close()
 
+    if batch_mode:
+      dataset = TensorDataset(pad_tensor(words, max_len), torch.LongTensor(tags))
+      dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=train_mode)
+      return dataloader, wordvocab, tagvocab
+    else:
+      return words, tags, wordvocab, tagvocab
 
-
-
-# if __name__ == "__main__" : 
-#   if len(sys.argv) != 5 or \
-#      sys.argv[3] not in ['bow', 'gru', 'cnn'] or \
-#      sys.argv[4] not in ['word', 'char'] : # Argparse!
-#     print("Usage: {} trainfile.txt devfile.txt bow|gru|cnn word|char".format(sys.argv[0]), file=sys.stderr) 
-#     sys.exit(-1)   
-#   hp = {"model_type": sys.argv[3], "in_type": sys.argv[4], "d_embed": 250, "d_hidden": 200}
-#   train_loader, wordvocab, tagvocab = read_corpus(sys.argv[1], None, None, hp["in_type"])
-#   dev_loader, _, _ = read_corpus(sys.argv[2], wordvocab, tagvocab, hp["in_type"], train_mode=False)
-#   if hp["model_type"] == "bow" :
-#     model = BOWClassifier(hp["d_embed"], len(wordvocab), len(tagvocab))
-#   elif hp["model_type"] == "gru" :
-#     model = GRUClassifier(hp["d_embed"], hp["d_hidden"], len(wordvocab), len(tagvocab))
-#   else: #if hp["model_type"] == "cnn" :
-#     model = CNNClassifier(hp["d_embed"], hp["d_hidden"], len(wordvocab), len(tagvocab))
-#   fit(model, 15, train_loader, dev_loader)
-#   torch.save({"wordvocab": dict(wordvocab), 
-#               "tagvocab": dict(tagvocab), 
-#               "model_params": model.state_dict(),
-#               "hyperparams": hp}, "model.pt")
+if __name__ == "__main__" : 
+  train_loader, wordvocab, tagvocab = read_corpus(filename="../pstal-etu/sequoia/sequoia-ud.parseme.frsemcor.simple.train", wordvocab=None, tagvocab=None, max_len=40, batch_size=32, train_mode=True, batch_mode=True)
+  num_embeddings= len(wordvocab) 
+  output_size= len(tagvocab) 
+  hidden_size=200
+  embedding_dim=250
+  hp = {
+    "model_type": "GRU", 
+    "embedding_dim": embedding_dim, 
+    "hidden_size": hidden_size}
+  
+  dev_loader, _, _ = read_corpus(filename="../pstal-etu/sequoia/sequoia-ud.parseme.frsemcor.simple.dev", wordvocab=wordvocab, tagvocab=tagvocab, max_len=40, batch_size=32, train_mode=False, batch_mode=True)
+  
+  model = RNN_postag(hidden_size=hidden_size, output_size=output_size, num_embeddings=num_embeddings, embedding_dim=embedding_dim, PAD_ID=0)
+  
+  fit(model=model, epochs=15, train_loader=train_loader, dev_loader=dev_loader)
+  
+  torch.save({"wordvocab": dict(wordvocab), 
+              "tagvocab": dict(tagvocab), 
+              "model_params": model.state_dict(),
+              "hyperparams": hp}, "model.pt")
