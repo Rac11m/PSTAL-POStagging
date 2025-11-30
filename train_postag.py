@@ -1,8 +1,5 @@
 import torch.nn as nn
-import tqdm, sys, torch
-from traitlets import default
-from pandas import read_clipboard
-import model_postag, use_conllulib
+import tqdm, torch
 from model_postag import RNN_postag
 from collections import defaultdict
 from use_conllulib import CoNLLUReader
@@ -17,14 +14,19 @@ def pad_tensor(X, max_len):
   return res
 
 def fit(model, epochs, train_loader, dev_loader):
-  criterion = nn.CrossEntropyLoss()
+  criterion = nn.CrossEntropyLoss(ignore_index=0)
   optimizer = torch.optim.Adam(model.parameters()) 
   for epoch in range(epochs):
     model.train()
     total_loss = 0
-    for (X, y) in tqdm.tqdm(train_loader) :      
+    for (X, y) in tqdm.tqdm(train_loader):
       optimizer.zero_grad()
-      y_hat = model(X)    
+      y_hat = model(X)
+      
+      B, T, C = y_hat.shape
+      y_hat = y_hat.reshape(B*T, C)
+      y = y.reshape(B*T)
+
       loss = criterion(y_hat, y)
       loss.backward()
       optimizer.step()
@@ -35,16 +37,23 @@ def fit(model, epochs, train_loader, dev_loader):
 
 def perf(model, dev_loader, criterion):
   model.eval()
-  total_loss = correct = 0
+  total_loss = correct = total_tokens = 0
   for (X, y) in dev_loader:
     with torch.no_grad():
       y_hat = model(X) 
+            
+      B, T, C = y_hat.shape
+      y_hat = y_hat.reshape(B*T, C)
+      y = y.reshape(B*T)
+
       total_loss += criterion(y_hat, y)
-      y_pred = torch.max(y_hat, dim=1)[1] # argmax
-      mask = (y_pred != model.PAD_ID)
-      correct += torch.sum((y_pred.data == y) * mask)
+      y_pred = y_hat.argmax(dim=-1)  
+      mask = (y != 0)                # only consider real tokens
+      correct += ((y_pred == y) * mask).sum().item()
+      total_tokens += mask.sum().item()
+      
   total = len(dev_loader.dataset)
-  return total_loss / total, correct / total
+  return total_loss / total, correct / total_tokens
 
 
 def read_corpus(filename, wordvocab, tagvocab, max_len, batch_size, train_mode=True, batch_mode=True):
@@ -54,6 +63,7 @@ def read_corpus(filename, wordvocab, tagvocab, max_len, batch_size, train_mode=T
       wordvocab["<UNK>"]
 
       tagvocab = defaultdict(lambda: len(tagvocab))
+      tagvocab["<PAD>"]
     
     words, tags = [], []
 
@@ -62,12 +72,16 @@ def read_corpus(filename, wordvocab, tagvocab, max_len, batch_size, train_mode=T
 
     for sent in conllu_reader.readConllu():
       
-      tag = sent[0]['upos']
-      if train_mode:
-        tags.append(tagvocab[tag])
-      else:
-        tags.append(tagvocab.get(tag, tagvocab["<PAD>"]))
+      sent_tags = []
+      for tok in sent:
+        tag = tok["upos"]
+        if train_mode:
+          sent_tags.append(tagvocab[tag])
+        else:
+          sent_tags.append(tagvocab.get(tag, tagvocab["<PAD>"]))
       
+      tags.append(sent_tags)
+
       forms = [tok["form"] for tok in sent]
 
       if train_mode:
@@ -78,7 +92,7 @@ def read_corpus(filename, wordvocab, tagvocab, max_len, batch_size, train_mode=T
     infile.close()
 
     if batch_mode:
-      dataset = TensorDataset(pad_tensor(words, max_len), torch.LongTensor(tags))
+      dataset = TensorDataset(pad_tensor(words, max_len), pad_tensor(tags, max_len))
       dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=train_mode)
       return dataloader, wordvocab, tagvocab
     else:
@@ -96,9 +110,7 @@ if __name__ == "__main__" :
     "hidden_size": hidden_size}
   
   dev_loader, _, _ = read_corpus(filename="../pstal-etu/sequoia/sequoia-ud.parseme.frsemcor.simple.dev", wordvocab=wordvocab, tagvocab=tagvocab, max_len=40, batch_size=32, train_mode=False, batch_mode=True)
-  
-  model = RNN_postag(hidden_size=hidden_size, output_size=output_size, num_embeddings=num_embeddings, embedding_dim=embedding_dim, PAD_ID=0)
-  
+  model = RNN_postag(hidden_size=hidden_size, output_size=output_size, num_embeddings=num_embeddings, embedding_dim=embedding_dim)
   fit(model=model, epochs=15, train_loader=train_loader, dev_loader=dev_loader)
   
   torch.save({"wordvocab": dict(wordvocab), 
